@@ -1,6 +1,6 @@
 #!/usr/bin/python
 
-#import sys
+import sys
 #import select
 import readchar
 import serial
@@ -12,6 +12,7 @@ import numpy.fft
 import subprocess
 import math
 import psutil
+from serial.serialutil import SerialException 
 
 ARDUINO_PORT = "/dev/tty.usbmodem1421"
 ARDUINO_SPEED = "115200"
@@ -20,12 +21,38 @@ CAMERA = None
 CAMERA_PORT = None
 DELTA = 40
 REFERENCE_FFT_RESULT = None
+REFERENCE_Z_POSITION = None
 Z_POSITION = 0
 GPHOTO2_BIN = "/usr/local/bin/gphoto2"
 
 CORRELATIONS = {}
 CORRELATIONS_RESETED = None
 CORRELATIONS_RESET_DELTA = 60 * 15 # reset correlations after 15 minutes
+MAX_FOCUS_DELTA = 100
+
+class Error(Exception):
+    """Base class for exceptions in this module."""
+    pass
+
+class PeripheralStatusError(Error):
+    """Exception raised for errors related to the status of peripherals
+
+    Attributes:
+        message -- explanation of the error
+    """
+
+    def __init__(self, message):
+        self.message = message
+
+class SystemError(Error):
+    """Exception raised for system errors when executing this script
+
+    Attributes:
+        message -- explanation of the error
+    """
+
+    def __init__(self, message):
+        self.message = message
 
 def log(msg):
   print "[{time}] {msg}".format(time=strftime("%Y-%m-%d %H:%M:%S", localtime()), msg=msg)
@@ -60,7 +87,7 @@ def reset_correlations(force=False):
     CORRELATIONS_RESETED = time()
 
 def capture_image(use_as_reference=False):
-  global REFERENCE_FFT_RESULT, Z_POSITION, CORRELATIONS, CORRELATIONS_RESETED
+  global REFERENCE_FFT_RESULT, REFERENCE_Z_POSITION, Z_POSITION, CORRELATIONS, CORRELATIONS_RESETED
   fname = capture_image_filename()
   out = subprocess.check_output([ 
     GPHOTO2_BIN,
@@ -75,6 +102,7 @@ def capture_image(use_as_reference=False):
   if use_as_reference or REFERENCE_FFT_RESULT is None:
     log("Captured image {fname}, used as reference image".format(fname=jpeg_fname))
     REFERENCE_FFT_RESULT = fft_result
+    REFERENCE_Z_POSITION = Z_POSITION
     reset_correlations(force=True)
   else:
     reset_correlations()
@@ -87,25 +115,28 @@ def capture_image(use_as_reference=False):
 def connect_arduino(ser):
   data = serial_readline(ser)
   if data != "HELLO":
-    raise Exception("Expected HELLO, but got {data}".format(data=data))
+    raise SystemError("Expected HELLO, but got {data}".format(data=data))
   
 def connect_camera():
   global CAMERA, CAMERA_PORT
   if not os.path.exists(GPHOTO2_BIN):
-    raise Exception("gphoto2 binary does not exist at {path}".format(path=GPHOTO2_BIN))
+    raise SystemError("gphoto2 binary does not exist at {path}".format(path=GPHOTO2_BIN))
 
   p = subprocess.Popen([GPHOTO2_BIN, "--auto-detect"], stdout=subprocess.PIPE)
   out, err = p.communicate()
   lines = out.splitlines()
 
+  if len(lines) == 2:
+    raise PeripheralStatusError("No camera found")
+
   if 'Model' not in lines[0]:
-    raise Exception("Unexpected output from gphoto2 --auto-detect")
+    raise SystemError("Unexpected output from gphoto2 --auto-detect")
 
   if '----' not in lines[1]:
-    raise Exception("Unexpected output from gphoto2 --auto-detect")
+    raise SystemError("Unexpected output from gphoto2 --auto-detect")
 
   if len(lines) != 3:
-    raise Exception("Only exactly one camera is now supported")
+    raise PeripheralStatusError("Only exactly one camera is now supported")
 
   CAMERA = lines[2][0:30].strip()
   CAMERA_PORT = lines[2][31:]
@@ -113,10 +144,14 @@ def connect_camera():
   log("Found camera {camera} on port {port}".format(camera=CAMERA, port=CAMERA_PORT))
 
 def ready():
-  log("Ready, q = -1, a = +1, z = capture image, r = capture image and use as reference, Ctrl-C = quit")
+  log("Ready, q = quit, a = -1, z = +1, t = take image, r = take image and use as reference, f = focus to reference image")
 
 def setup():
-  ser = serial.Serial(ARDUINO_PORT, baudrate=ARDUINO_SPEED)
+  try:
+    ser = serial.Serial(ARDUINO_PORT, baudrate=ARDUINO_SPEED)
+  except SerialException as err:
+    raise PeripheralStatusError("Could not connect to Arduino: " + err.strerror)
+  
   return ser
 
 def getchar():
@@ -145,12 +180,28 @@ def serial_readline(ser):
 def move_z(ser, value):
   global Z_POSITION
   Z_POSITION += value
-  serial_writeline(ser, 1)
+  serial_writeline(ser, value)
   log("Z: {z}".format(z=Z_POSITION))
 
-def focus():
-  pass
+def focus_get_correlation(ser, pos):
+  if pos in CORRELATIONS:
+    return CORRELATIONS[pos]
+  else:
+    if math.abs(REFERENCE_Z_POSITION - pos) > MAX_FOCUS_DELTA:
+      raise PeripheralStatusError("We are too far away from reference z position, maximum allowed is {max_focus_delta}".format(max_focus_delta=MAX_FOCUS_DELTA))
+    move_z(ser, Z_POSITION - pos)
+    capture_image()
+    return CORRELATIONS[pos]
 
+def focus(ser):
+  original_position = Z_POSITION
+  for x in [ -10, -5, 0, 5, 10 ]:
+    focus_get_correlation(ser, original_position + x)
+  z = np.polyfit(CORRELATIONS.keys(), CORRELATIONS.values(), 2)
+  p = np.poly1d(z)
+  scipy.optimize.minimize_scalar(p)
+  pass
+  
 def main():
   ser = setup()
 
@@ -162,13 +213,23 @@ def main():
   while True:
     ready()
     ch = getchar()
-    if ch == 'q':
+    if ch == 'a':
       move_z(ser, -1)
-    elif ch == 'a':
-      move_z(ser, 1)
     elif ch == 'z':
+      move_z(ser, 1)
+    elif ch == 't':
       capture_image()
     elif ch == 'r':
       capture_image(use_as_reference=True)
+    elif ch == 'f':
+      focus()
+    elif ch == 'q':
+      log("Exiting");
+      sys.exit(0)
 
-main()
+if __name__ == "__main__":
+  try:
+    main()
+  except PeripheralStatusError as err:
+    print err.message
+    sys.exit(1)
