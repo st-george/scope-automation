@@ -5,7 +5,7 @@ import time
 from serial.serialutil import SerialException 
 import io
 
-ARDUINO_PORT = "/dev/tty.usbmodem14111"
+ARDUINO_PORT = "/dev/tty.usbmodem1421"
 ARDUINO_SPEED = "115200"
 
 class Error(Exception):

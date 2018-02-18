@@ -2,10 +2,9 @@
 
 import subprocess
 import sys
-#import select
 import readchar
 import serial
-from time import localtime, strftime, time
+from time import localtime, strftime, time, sleep
 import os
 import scipy.ndimage
 import numpy as np
@@ -13,7 +12,6 @@ import numpy.fft
 import subprocess
 import math
 import psutil
-from serial.serialutil import SerialException 
 import io
 import logging
 import gphoto2 as gp
@@ -37,6 +35,9 @@ REFERENCE_Z_POSITION = None
 MAX_DELTA_TO_REFERENCE_Z_POSITION = 500
 Z_POSITION = 0
 AUTOFOCUS_BOUND = 50
+AUTOFOCUS_STEP = 5
+MOTOR_SLEEP_MULTIPLIER = 0.03
+TIMELAPSE_INTERVAL_MS = 5000
 
 class ImageWebSocket(tornado.websocket.WebSocketHandler):
     clients = set()
@@ -47,15 +48,15 @@ class ImageWebSocket(tornado.websocket.WebSocketHandler):
 
     def open(self):
         ImageWebSocket.clients.add(self)
-        print("WebSocket opened from: " + self.request.remote_ip)
+        log("WebSocket opened from: " + self.request.remote_ip)
 
     def on_message(self, message):
-        jpeg_bytes = get_preview_image()
+        jpeg_bytes = get_preview_image().getvalue()
         self.write_message(jpeg_bytes, binary=True)
 
     def on_close(self):
         ImageWebSocket.clients.remove(self)
-        print("WebSocket closed from: " + self.request.remote_ip)
+        log("WebSocket closed from: " + self.request.remote_ip)
 
 class Error(Exception):
     """Base class for exceptions in this module."""
@@ -82,7 +83,7 @@ class SystemError(Error):
         self.message = message
 
 def log(msg):
-  print "[{time}] {msg}".format(time=strftime("%Y-%m-%d %H:%M:%S", localtime()), msg=msg)
+  print("[{time}] {msg}".format(time=strftime("%Y-%m-%d %H:%M:%S", localtime()), msg=msg))
 
 # needed on OS X
 def kill_ptpcamera():
@@ -95,7 +96,7 @@ def kill_ptpcamera():
 def sample_and_fft(image_data):
   img = imageio.imread(image_data, "JPEG-PIL")
   res = None
-  for i in xrange(0, img.shape[0], DELTA):
+  for i in range(0, img.shape[0], DELTA):
     vec = np.absolute(numpy.fft.fft(img[:][i].flatten()))**2
     if res is None:
       res = vec
@@ -109,18 +110,19 @@ def image_filename():
 def get_preview_image():
   camera_file = gp.check_result(gp.gp_camera_capture_preview(CAMERA))
   file_data = gp.check_result(gp.gp_file_get_data_and_size(camera_file))
-  buf = io.BytesIO(file_data)
-  buf.seek(0)
+  buf =	io.BytesIO(file_data)
+  buf.seek(0) 
   return buf
 
-def get_store_and_show_image():
+def get_store_and_maybe_show_image(show_image=False):
   file_path = gp.check_result(gp.gp_camera_capture(CAMERA, gp.GP_CAPTURE_IMAGE))
   log('Camera file path: {0}/{1}'.format(file_path.folder, file_path.name))
   target = image_filename()
-  print 'Copying image to {target}'.format(target=target)
+  log('Copying image to {target}'.format(target=target))
   camera_file = gp.check_result(gp.gp_camera_file_get(CAMERA, file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL))
   gp.check_result(gp.gp_file_save(camera_file, target))
-  subprocess.call(['open', target])
+  if show_image:
+    subprocess.call(['open', target])
   return target
 
 def current_position_take_preview_image_and_set_as_reference():
@@ -128,30 +130,38 @@ def current_position_take_preview_image_and_set_as_reference():
   image = get_preview_image()
   REFERENCE_FFT_RESULT = sample_and_fft(image)
   REFERENCE_Z_POSITION = Z_POSITION
-  print "Using current position {pos} as reference".format(pos=Z_POSITION)
+  log("Using current position {pos} as reference".format(pos=Z_POSITION))
 
-def current_position_take_image_and_get_correlation_with_reference():
+def current_position_take_preview_image_and_get_correlation_with_reference():
   image = get_preview_image()
   fft_result = sample_and_fft(image)
   corr = np.corrcoef(REFERENCE_FFT_RESULT, fft_result)[1,0]
   log("Captured image position {pos} correlation {corr}".format(pos=Z_POSITION, corr=corr))
   return corr
 
-def connect_arduino(ser):
+def setup_arduino():
+  try:
+    ser = serial.Serial(ARDUINO_PORT, baudrate=ARDUINO_SPEED)
+  except serial.SerialException as err:
+    raise PeripheralStatusError("Could not connect to Arduino: " + err.strerror)
+  return ser
+
+def connect_arduino():
+  ser = setup_arduino()
   data = serial_readline(ser)
-  if data != "HELLO":
+  if data != b"HELLO":
     raise SystemError("Expected HELLO, but got {data}".format(data=data))
+  return ser
   
 def connect_camera():
   global CAMERA
 
-  logging.basicConfig(format='%(levelname)s: %(name)s: %(message)s', level=logging.WARNING)
+  logging.basicConfig(format='%(levelname)s: %(name)s: %(message)s', level=logging.ERROR)
   gp.check_result(gp.use_python_logging())
   CAMERA = gp.check_result(gp.gp_camera_new())
   gp.check_result(gp.gp_camera_init(CAMERA))
 
-  # required configuration will depend on camera type!
-  print "Checking camera config"
+  log("Checking camera config")
   # get configuration tree
   config = gp.check_result(gp.gp_camera_get_config(CAMERA))
   # find the image format config item
@@ -173,32 +183,11 @@ def connect_camera():
       gp.check_result(gp.gp_camera_set_config(CAMERA, config))
 
 def ready():
-  log("Ready, q = quit, a = -1, z = +1, t = take and show image, r = use current position as reference, f = find position with highest correlation with reference")
-
-def setup():
-  try:
-    ser = serial.Serial(ARDUINO_PORT, baudrate=ARDUINO_SPEED)
-  except SerialException as err:
-    raise PeripheralStatusError("Could not connect to Arduino: " + err.strerror)
-
-  return ser
-
-def getchar():
-  #i, o, e = select.select([sys.stdin], [], [], 10)
-
-  char = readchar.readchar()
-
-  if char == '\x03':
-    raise KeyboardInterrupt
-  elif char == '\x04':
-    raise EOFError
-  elif char == '\x1a':
-    os.kill(0, signal.SIGTSTP)
-  return char
+  log("Ready, ctrl-c = quit, a = -1, z = +1, t = timelapse, s = shoot and show image, r = use current position as reference, f = find position with highest correlation with reference")
 
 def serial_writeline(ser, data):
   log("ARDUINO -> {data}".format(data=data))
-  ser.write("{data}\r\n".format(data=data));
+  ser.write(("{data}\r\n".format(data=data)).encode())
 
 def serial_readline(ser):
   data = ser.readline()[:-2]
@@ -207,61 +196,108 @@ def serial_readline(ser):
   return data
 
 def move_z(ser, value):
-  global Z_POSITION
-  if abs(Z_POSITION - REFENCE_Z_POSITION) > MAX_DELTA_TO_REFERENCE_Z_POSITION:
-    raise PeripheralStatusError("Reached maximum delta to reference z position")
+  global Z_POSITION, REFERENCE_Z_POSITION, MAX_DELTA_TO_REFERENCE_Z_POSITION
+  if REFERENCE_Z_POSITION is not None:
+    if abs(Z_POSITION - REFERENCE_Z_POSITION) > MAX_DELTA_TO_REFERENCE_Z_POSITION:
+        raise PeripheralStatusError("Reached maximum delta to reference z position")
   Z_POSITION += value
   serial_writeline(ser, value)
+  sleep(MOTOR_SLEEP_MULTIPLIER * abs(value))
   log("Z: {z}".format(z=Z_POSITION))
 
 def find_position_with_lowest_correlation_with_reference(ser, level=1):
+  # bail out if we are moving more than 5 * (AUTOFOCUS_BOUND / 2)
   if level > 5:
     raise PeripheralStatusError("Reached maximum limit for autofocus")
+
+  # start capturing images from -AUTOFOCUS_BOUND
   move_z(ser, -1 * AUTOFOCUS_BOUND)
-  xa = xrange(-1 * AUTOFOCUS_BOUND, AUTOFOCUS_BOUND, 5)
+
+  # find correlations for positions [-AUTOFOCUS_BOUND, AUTOFOCUS_BOUND]
+  xa = range(-1 * AUTOFOCUS_BOUND, AUTOFOCUS_BOUND, AUTOFOCUS_STEP)
   ya = []
-  for i in xa:
-    move_z(ser, 2)
-    corr = current_position_take_image_and_get_correlation_with_reference()
-    log("Index %d has correlation %r)" % (i, corr))
+
+  for x in xa:
+    move_z(ser, AUTOFOCUS_STEP)
+    corr = current_position_take_preview_image_and_get_correlation_with_reference()
+    log("Index %d has correlation %r)" % (x, corr))
     ya.append(corr)
+
+  # fit correlations on a 2-degree polynomial
   z = np.polyfit(xa, ya, 2)
   p = np.poly1d(z)
+
+  # optimize the polynomial
   result = scipy.optimize.minimize_scalar(-1 * p, method='bounded', bounds=[-1 * AUTOFOCUS_BOUND, AUTOFOCUS_BOUND])
   new_pos = round(result.x)
-  move_z(ser, -1 * AUTOFOCUS_BOUND + new_pos)
-  if abs(new_pos) + 3 > AUTOFOCUS_BOUND:
-    find_position_with_lowest_correlation_with_reference(ser, level + 1)
 
-def main():
-  ser = setup()
+  # we are close to the start or end of the range, move to
+  if abs(new_pos) + 3 > AUTOFOCUS_BOUND:
+    move_z(ser, -1 * AUTOFOCUS_BOUND + new_pos)
+    find_position_with_lowest_correlation_with_reference(ser, level + 1)
+  else:
+    move_z(ser, -1 * AUTOFOCUS_BOUND + new_pos)
+
+def setup():
   kill_ptpcamera()
   connect_camera()
-  connect_arduino(ser)
+  try:
+    ser = connect_arduino()
+  except PeripheralStatusError as err:
+    log("Could not connect to Arduino, motor movements disabled")
+    return None
+  return ser
 
 def read_key(fd):
-  print "IN READ KEY"
-  sys.stdin.read(1)
+  char = sys.stdin.read(1)
+  # Ctrl-C = Break
+  if char == '\x03':
+    raise KeyboardInterrupt
+  # Ctrl-D = EOF
+  #elif char == '\x04':
+  #  raise EOFError
+  # Ctrl-Z = SIGTSTP
+  #elif char == '\x1a':
+  #  os.kill(0, signal.SIGTSTP)
+  return char
 
-def keyboard_control(fd, events):
+def timelapse():
+    get_store_and_maybe_show_image(False)
+
+def keyboard_control(fd, arduino_serial, timelapse_callback):
+  ready()
   ch = read_key(fd)
   if ch == 'a':
-    move_z(ser, -1)
+    if arduino_serial is None:
+      log("No connection to scope controller, motor movements are disabled")
+    else:
+      move_z(arduino_serial, -1) 
   elif ch == 'z':
-    move_z(ser, 1)
+    if arduino_serial is None:
+      log("No connection to scope controller , motor movements are disabled")
+    else:
+      move_z(arduino_serial, 1)
   elif ch == 't':
-    get_and_store_image()
+    log("Starting timelapse, interval between takes is {iv} ms".format(iv=TIMELAPSE_INTERVAL_MS))
+    timelapse_callback.start()
+  elif ch == 'g':
+    log("Stopping timelapse")
+    timelapse_callback.stop()
+  elif ch == 's':
+    get_store_and_maybe_show_image(True)
   elif ch == 'r':
     current_position_take_preview_image_and_set_as_reference()
   elif ch == 'f':
-    find_position_with_lowest_correlation_with_reference(ser)
-  elif ch == 'q':
-    log("Exiting");
-    sys.exit(0)
+    if arduino_serial is None:
+      log("No connection to scope controller , motor movements are disabled")
+    else:
+      find_position_with_lowest_correlation_with_reference(arduino_serial)
 
 if __name__ == "__main__":
   script_path = os.path.dirname(os.path.realpath(__file__))
   static_path = script_path + '/static/'
+
+  arduino_serial = setup()
 
   app = tornado.web.Application([
       (r"/websocket", ImageWebSocket),
@@ -271,15 +307,23 @@ if __name__ == "__main__":
 
   old_settings = termios.tcgetattr(sys.stdin)
   tty.setcbreak(sys.stdin, when=TCSANOW)
-  tornado.ioloop.IOLoop.current().add_handler(sys.stdin, keyboard_control, tornado.ioloop.IOLoop.READ|tornado.ioloop.IOLoop.ERROR)
 
-  print("Starting server: http://localhost:" + str(LISTEN_PORT) + "/")
+  timelapse_callback = tornado.ioloop.PeriodicCallback(
+    timelapse, 
+    TIMELAPSE_INTERVAL_MS)
+
+  tornado.ioloop.IOLoop.current().add_handler(
+    sys.stdin, 
+    lambda fd, events: keyboard_control(fd, arduino_serial, timelapse_callback),
+    tornado.ioloop.IOLoop.READ|tornado.ioloop.IOLoop.ERROR)
+
+  log("Starting server: http://localhost:" + str(LISTEN_PORT) + "/")
 
   try:
     tornado.ioloop.IOLoop.current().start()
 
   finally:
-    print "out of loop"
+    log("Exiting")
     termios.tcsetattr(sys.stdin, TCSANOW, old_settings)
 
     sys.exit(0)
