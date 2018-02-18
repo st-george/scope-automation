@@ -14,7 +14,6 @@
 
 #include <Wire.h>
 #include <Adafruit_MotorShield.h>
-#include <Adafruit_PWMServoDriver.h>
 
 Adafruit_MotorShield AFMS = Adafruit_MotorShield(); 
 
