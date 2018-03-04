@@ -57,11 +57,11 @@ def main():
     ser = setup()
     connect_arduino(ser)
     print "Turning 50 steps forward\n"
-    serial_writeline(ser, "50");
+    serial_writeline(ser, "M50");
     print "Sleeping 5 seconds\n"
     time.sleep(5)
     print "Turning 25 steps backward\n"
-    serial_writeline(ser, "-25");
+    serial_writeline(ser, "M-25");
   except Error as err:
     print err
 
