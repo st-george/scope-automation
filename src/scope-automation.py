@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import itertools
+import glob
 import subprocess
 import sys
 import readchar
@@ -25,7 +27,7 @@ from termios import TCSANOW
 
 LISTEN_PORT = 8080
 
-ARDUINO_PORT = "/dev/tty.usbmodem1421"
+ARDUINO_PORT_GLOBS = ["/dev/tty.usbmodem142?", "/dev/tty.wchusbserial142?"]
 ARDUINO_SPEED = "115200"
 
 CAMERA = None
@@ -81,6 +83,9 @@ class SystemError(Error):
 
     def __init__(self, message):
         self.message = message
+
+def flatten(list2d):
+  return list(itertools.chain(*list2d))
 
 def log(msg):
   print("[{time}] {msg}".format(time=strftime("%Y-%m-%d %H:%M:%S", localtime()), msg=msg))
@@ -140,11 +145,12 @@ def current_position_take_preview_image_and_get_correlation_with_reference():
   return corr
 
 def setup_arduino():
-  try:
-    ser = serial.Serial(ARDUINO_PORT, baudrate=ARDUINO_SPEED)
-  except serial.SerialException as err:
-    raise PeripheralStatusError("Could not connect to Arduino: " + err.strerror)
-  return ser
+  for arduino_port in flatten([glob.glob(x) for x in ARDUINO_PORT_GLOBS]):
+    try:
+      ser = serial.Serial(arduino_port, baudrate=ARDUINO_SPEED)
+    except serial.SerialException as err:
+      raise PeripheralStatusError("Could not connect to Arduino: " + err.strerror)
+    return ser
 
 def connect_arduino():
   ser = setup_arduino()
@@ -155,7 +161,6 @@ def connect_arduino():
   
 def connect_camera():
   global CAMERA
-
   logging.basicConfig(format='%(levelname)s: %(name)s: %(message)s', level=logging.ERROR)
   gp.check_result(gp.use_python_logging())
   CAMERA = gp.check_result(gp.gp_camera_new())
@@ -195,13 +200,27 @@ def serial_readline(ser):
     log("ARDUINO <- {data}".format(data=data))
   return data
 
+# focus camera using remote shutter port, wakes up the camera if asleep
+def camera_focus(ser):
+  serial_writeline(ser, "F");
+  data = serial_readline(ser)
+  if data != "OK F":
+    raise PeripheralStatusError("Camera focus returned error: {}".format(data))
+
+# shutter camera using remote shutter port, wakes up the camera if asleep
+def camera_shutter(ser):
+  serial_writeline(ser, "S");
+  data = serial_readline(ser)
+  if data != "OK S":
+    raise PeripheralStatusError("Camera focus returned error: {}".format(data))
+
 def move_z(ser, value):
   global Z_POSITION, REFERENCE_Z_POSITION, MAX_DELTA_TO_REFERENCE_Z_POSITION
   if REFERENCE_Z_POSITION is not None:
     if abs(Z_POSITION - REFERENCE_Z_POSITION) > MAX_DELTA_TO_REFERENCE_Z_POSITION:
         raise PeripheralStatusError("Reached maximum delta to reference z position")
   Z_POSITION += value
-  serial_writeline(ser, value)
+  serial_writeline(ser, "M" + str(value))
   sleep(MOTOR_SLEEP_MULTIPLIER * abs(value))
   log("Z: {z}".format(z=Z_POSITION))
 
@@ -239,13 +258,15 @@ def find_position_with_lowest_correlation_with_reference(ser, level=1):
     move_z(ser, -1 * AUTOFOCUS_BOUND + new_pos)
 
 def setup():
-  kill_ptpcamera()
-  connect_camera()
   try:
     ser = connect_arduino()
   except PeripheralStatusError as err:
     log("Could not connect to Arduino, motor movements disabled")
     return None
+  if ser:
+    camera_focus(ser)
+  kill_ptpcamera()
+  connect_camera()
   return ser
 
 def read_key(fd):
