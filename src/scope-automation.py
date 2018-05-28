@@ -27,7 +27,7 @@ from termios import TCSANOW
 
 LISTEN_PORT = 8080
 
-ARDUINO_PORT_GLOBS = ["/dev/tty.usbmodem142?", "/dev/tty.wchusbserial142?"]
+ARDUINO_PORT_GLOBS = ["/dev/tty.usbmodem14*", "/dev/tty.wchusbserial14*"]
 ARDUINO_SPEED = "115200"
 
 CAMERA = None
